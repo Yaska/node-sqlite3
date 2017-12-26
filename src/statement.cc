@@ -103,49 +103,49 @@ NAN_METHOD(Statement::New) {
 
     Database* db = Nan::ObjectWrap::Unwrap<Database>(info[0].As<Object>());
     Local<String> sql = Local<String>::Cast(info[1]);
+    Local<Function> callback = Local<Function>::Cast(info[2]);
 
     Nan::ForceSet(info.This(),Nan::New("sql").ToLocalChecked(), sql, ReadOnly);
 
     Statement* stmt = new Statement(db);
     stmt->Wrap(info.This());
 
-    PrepareBaton* baton = new PrepareBaton(db, Local<Function>::Cast(info[2]), stmt);
-    baton->sql = std::string(*Nan::Utf8String(sql));
-    db->Schedule(Work_BeginPrepare, baton);
-
-    info.GetReturnValue().Set(info.This());
-}
-
-void Statement::Work_BeginPrepare(Database::Baton* baton) {
-    assert(baton->db->open);
-    baton->db->pending++;
-    int status = uv_queue_work(uv_default_loop(),
-        &baton->request, Work_Prepare, (uv_after_work_cb)Work_AfterPrepare);
-    assert(status == 0);
-}
-
-void Statement::Work_Prepare(uv_work_t* req) {
-    STATEMENT_INIT(PrepareBaton);
+    assert(db->open);
 
     // In case preparing fails, we use a mutex to make sure we get the associated
     // error message.
-    sqlite3_mutex* mtx = sqlite3_db_mutex(baton->db->_handle);
+    sqlite3_mutex* mtx = sqlite3_db_mutex(db->_handle);
     sqlite3_mutex_enter(mtx);
 
+    std::string sqlStr = std::string(*Nan::Utf8String(sql));
     stmt->status = sqlite3_prepare_v2(
-        baton->db->_handle,
-        baton->sql.c_str(),
-        baton->sql.size(),
+        db->_handle,
+        sqlStr.c_str(),
+        sqlStr.size(),
         &stmt->_handle,
         NULL
     );
 
     if (stmt->status != SQLITE_OK) {
-        stmt->message = std::string(sqlite3_errmsg(baton->db->_handle));
+        stmt->message = std::string(sqlite3_errmsg(db->_handle));
         stmt->_handle = NULL;
     }
-
     sqlite3_mutex_leave(mtx);
+    if (stmt->status != SQLITE_OK) {
+        PrepareBaton* baton = new PrepareBaton(db, callback, stmt);
+        Error(baton);
+        stmt->Finalize();
+    }
+    else {
+        stmt->prepared = true;
+        if (!callback.IsEmpty() && callback->IsFunction()) {
+            Local<Value> argv[] = { Nan::Null() };
+            TRY_CATCH_CALL(stmt->handle(), callback, 1, argv);
+        }
+    }
+
+
+    info.GetReturnValue().Set(info.This());
 }
 
 void Statement::Work_AfterPrepare(uv_work_t* req) {
